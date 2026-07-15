@@ -1,0 +1,242 @@
+name: Build NP2 Kernel
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel source repo'
+        required: false
+        type: string
+        default: 'https://github.com/arter97/android_kernel_nothing_sm8475.git'
+      kernel_branch:
+        description: 'Kernel branch'
+        required: false
+        type: string
+        default: 'master'
+      kernel_defconfig:
+        description: 'Defconfig (relative to /)'
+        required: false
+        type: string
+        default: 'defconfig'
+      extra_configs:
+        description: 'Extra config fragments to merge (space-separated, relative to /)'
+        required: false
+        type: string
+        default: ''
+
+  workflow_call:
+    inputs:
+      kernel_repo:
+        required: false
+        type: string
+        default: 'https://github.com/arter97/android_kernel_nothing_sm8475.git'
+      kernel_branch:
+        required: false
+        type: string
+        default: 'master'
+      kernel_defconfig:
+        required: false
+        type: string
+        default: 'defconfig'
+      extra_configs:
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MAKE_ARGS: >-
+        ARCH=arm64
+        CROSS_COMPILE=aarch64-linux-gnu-
+        CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+        LLVM=1 LLVM_IAS=1
+        LD=ld.lld HOSTLD=ld.lld
+        CC=clang CXX=clang++
+        HOSTCC=clang HOSTCXX=clang++
+        O=out
+      LLVM_AR: /usr/bin/llvm-ar
+      LLVM_OBJDUMP: /usr/bin/llvm-objdump
+      LLVM_NM: /usr/bin/llvm-nm
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev \
+            lz4 zip python3 clang llvm lld gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi
+
+
+      - name: Clone sources
+        run: |
+          # Kernel
+          git clone --depth=1 -b "${{ inputs.kernel_branch || 'master' }}" \
+            "${{ inputs.kernel_repo || 'https://github.com/arter97/android_kernel_nothing_sm8475.git' }}" \
+            kernel
+
+          # AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          rm -rf AnyKernel3/.git
+
+          # SUSFS
+          git clone --depth=1 -b gki-android12-5.10 \
+            https://gitlab.com/simonpunk/susfs4ksu.git
+
+      - name: Setup ReSukiSU
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+
+      - name: Apply SUSFS patches
+        run: |
+          cd kernel
+
+          # Fix issues with avc selinux
+          patch -p1 < ../patches/avc_patch.diff
+
+          # Copy SUSFS source files
+          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+
+          # Apply kernel patch with fail-safe
+          patch -p1 --force < ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch || true
+
+          # Safety net: force susfs.o into the build regardless of Kconfig resolution.
+          # The Configure step uses scripts/config to guarantee CONFIG_KSU_SUSFS=y,
+          # but obj-y avoids a silent empty-object link failure if it gets dropped.
+          # sed -i 's/obj-$(CONFIG_KSU_SUSFS) += susfs.o/obj-y += susfs.o/' fs/Makefile
+          # grep -q 'susfs\.o' fs/Makefile || echo 'obj-y += susfs.o' >> fs/Makefile
+
+      # In case I need the below for other kernel I keep it but not needed rn :b
+      # - name: Add ReSukiSU patches
+      #   run: |
+      #     cd kernel
+      #     # Apply ReSukiSU patches
+      #     find ../patches -type f -name '*.diff' | while read -r patch; do
+      #       echo "Applying $patch"
+      #       patch -p1 < "$patch"
+      #     done
+
+      - name: Configure kernel
+        run: |
+          cd kernel
+          DEFCONFIG="./${{ inputs.kernel_defconfig || 'defconfig' }}"
+
+          # Merge extra config fragments into defconfig (if any)
+          EXTRA="${{ inputs.extra_configs }}"
+          if [ -n "$EXTRA" ]; then
+            for frag in $EXTRA; do
+              FRAG_PATH="./$frag"
+              if [ -f "$FRAG_PATH" ]; then
+                echo "Merging: $frag"
+                cat "$FRAG_PATH" >> "$DEFCONFIG"
+              fi
+            done
+          fi
+
+          # Add ReSukiSU configs
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+          echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
+
+          # Generate initial .config from defconfig
+          make $MAKE_ARGS "${{ inputs.kernel_defconfig || 'defconfig' }}"
+
+          # Force-set configs via scripts/config so Kconfig cannot silently drop them
+          KCFG="./scripts/config --file out/.config"
+          $KCFG -e KSU
+          $KCFG -e KSU_SUSFS
+
+          # Resolve dependencies without dropping our forced configs
+          make $MAKE_ARGS olddefconfig
+
+          # Remove -dirty suffix
+          [ -f scripts/setlocalversion ] && sed -i 's/-dirty//g' scripts/setlocalversion || true
+
+      - name: Enable swap space
+        run: |
+          # Remove existing swap file first
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Build kernel
+        run: |
+          cd kernel
+          # Reduce parallel jobs to prevent memory exhaustion
+          JOBS=$(( $(nproc) / 2 ))
+          [ "$JOBS" -lt 1 ] && JOBS=1
+
+          make -j$JOBS $MAKE_ARGS KCFLAGS="-Wno-error"
+
+      - name: Package AnyKernel3
+        run: |
+          # Verify build output exists
+          if [ ! -f kernel/out/arch/arm64/boot/Image ]; then
+            echo "ERROR: kernel Image not found — build failed"
+            exit 1
+          fi
+
+          # Copy kernel image
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+          cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/ 2>/dev/null || true
+
+          # Copy anykernel.sh from repo and set variant kernel string
+          cp Scripts/anykernel.sh AnyKernel3/anykernel.sh
+          sed -i 's/kernel.string=.*/kernel.string=NP2 Kernel - ReSukiSU/' AnyKernel3/anykernel.sh
+
+          # Create zip
+          cd AnyKernel3
+          ZIP_NAME="ReSukiSU-NP2-Pong.zip"
+          zip -r9 "../$ZIP_NAME" ./*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-NP2-ReSukiSU
+          path: "*.zip"
+          retention-days: 30
+
+      - name: Upload .config for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-NP2-ReSukiSU
+          path: kernel/out/.config
+          retention-days: 1
+
+      - name: Collect .rej files
+        if: always()
+        id: collect_rej
+        run: |
+          mkdir -p rej
+          found="false"
+          while IFS= read -r -d '' f; do
+            found="true"
+            mkdir -p "rej/$(dirname "$f")"
+            cp "$f" "rej/$f"
+            orig="${f%.rej}"
+            [ -f "$orig" ] && cp "$orig" "rej/$orig"
+          done < <(find . -name '*.rej' -print0)
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .rej files
+        if: always() && steps.collect_rej.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rej-NP2-ReSukiSU
+          path: rej/
