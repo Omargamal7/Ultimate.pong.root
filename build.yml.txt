@@ -1,0 +1,261 @@
+name: Build NP2 Kernel
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel source repo'
+        required: false
+        type: string
+        default: 'https://github.com/LineageOS/android_kernel_nothing_sm8475.git'
+      kernel_branch:
+        description: 'Kernel branch'
+        required: false
+        type: string
+        default: 'lineage-23.2'
+      kernel_defconfig:
+        description: 'Defconfig(s), space-separated. Use /name if it is in the kernel root; otherwise arch/arm64/configs/name is used.'
+        required: false
+        type: string
+        default: 'gki_defconfig'
+      extra_configs:
+        description: 'Extra config fragments (space-separated, start with / if it is in the kernel root)'
+        required: false
+        type: string
+        default: 'vendor/waipio_GKI.config vendor/nothing/waipio_GKI.config vendor/debugfs.config'
+      susfs_support:
+        description: 'Enable SUSFS support'
+        required: false
+        type: boolean
+        default: true
+      susfs_branch:
+        description: 'SUSFS branch (also selects patch name)'
+        required: false
+        type: string
+        default: 'gki-android13-5.10'
+      extra_patches_dir:
+        description: 'Extra patch directory (repo-local)'
+        required: false
+        type: string
+        default: ''
+      bbg_support:
+        description: 'Enable BBG support'
+        required: false
+        type: boolean
+        default: true
+      susfs_force:
+        description: 'Force SUSFS patch apply (ignore failures)'
+        required: false
+        type: boolean
+        default: false
+      kernel_type:
+        description: 'Kernel type identifier (arter97, NothingOSS, LineageOS)'
+        required: false
+        type: string
+        default: 'LineageOS'
+
+  workflow_call:
+    inputs:
+      kernel_repo:
+        required: false
+        type: string
+        default: 'https://github.com/LineageOS/android_kernel_nothing_sm8475.git'
+      kernel_branch:
+        required: false
+        type: string
+        default: 'lineage-23.2'
+      kernel_defconfig:
+        description: 'Defconfig(s), space-separated. Use /name if it is in the kernel root; otherwise arch/arm64/configs/name is used.'
+        required: false
+        type: string
+        default: 'gki_defconfig'
+      extra_configs:
+        required: false
+        type: string
+        default: 'vendor/waipio_GKI.config vendor/nothing/waipio_GKI.config vendor/debugfs.config'
+      susfs_support:
+        required: false
+        type: boolean
+        default: true
+      susfs_branch:
+        required: false
+        type: string
+        default: 'gki-android13-5.10'
+      extra_patches_dir:
+        required: false
+        type: string
+        default: ''
+      bbg_support:
+        required: false
+        type: boolean
+        default: false
+      susfs_force:
+        required: false
+        type: boolean
+        default: false
+      kernel_type:
+        required: false
+        type: string
+        default: 'LineageOS'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      KERNEL_DIR: kernel
+      ANYKERNEL_DIR: AnyKernel3
+      DEFCONFIG: ${{ inputs.kernel_defconfig }}
+      DEFCONFIG_FRAGS: ${{ inputs.extra_configs }}
+      MAKE_ARGS: >-
+        ARCH=arm64
+        CROSS_COMPILE=aarch64-linux-gnu-
+        CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+        LLVM=1 LLVM_IAS=1
+        LD=ld.lld HOSTLD=ld.lld
+        CC=clang CXX=clang++
+        HOSTCC=clang HOSTCXX=clang++
+        O=out
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev ccache \
+            lz4 zip python3 clang llvm lld gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi wget
+
+      - name: Setup LLVM toolchain path (arter97 compat)
+        if: ${{ contains(inputs.kernel_repo || '', 'arter97/android_kernel_nothing_sm8475') }}
+        run: |
+          llvm_dir=/home/arter97/android/nathan/llvm-22.1.0-x86_64/bin
+          sudo mkdir -p "$llvm_dir"
+          for tool in clang clang++ llvm-ar llvm-nm llvm-objdump llvm-objcopy llvm-readelf llvm-strip ld.lld; do
+            src=$(command -v "$tool" || true)
+            [ -n "$src" ] && sudo ln -sf "$src" "$llvm_dir/$tool"
+          done
+
+      - name: Clone sources
+        run: |
+          git clone --depth=1 -b "${{ inputs.kernel_branch || 'lineage-23.2' }}" \
+            "${{ inputs.kernel_repo || 'https://github.com/LineageOS/android_kernel_nothing_sm8475.git' }}" \
+            "$KERNEL_DIR"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$ANYKERNEL_DIR"
+          rm -rf "$ANYKERNEL_DIR/.git"
+
+      - name: Clone SUSFS
+        if: ${{ inputs.susfs_support == true }}
+        run: |
+          git clone --depth=1 -b "${{ inputs.susfs_branch || 'gki-android13-5.10' }}" \
+            https://gitlab.com/simonpunk/susfs4ksu.git
+
+      - name: Setup ReSukiSU
+        run: |
+          cd "$KERNEL_DIR"
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+
+      - name: Apply extra patches
+        if: ${{ inputs.extra_patches_dir != '' }}
+        run: |
+          patch_dir="$GITHUB_WORKSPACE/${{ inputs.extra_patches_dir }}"
+          if [ ! -d "$patch_dir" ]; then
+            echo "Extra patches dir not found: $patch_dir" >&2
+            exit 1
+          fi
+          cd "$KERNEL_DIR"
+          find "$patch_dir" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) -print0 | sort -z | while IFS= read -r patch; do
+            echo "Applying $patch"
+            patch -p1 < "$patch"
+          done
+
+      - name: Apply SUSFS patches
+        if: ${{ inputs.susfs_support == true }}
+        run: |
+          cd "$KERNEL_DIR"
+          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          susfs_patch="../susfs4ksu/kernel_patches/50_add_susfs_in_${{ inputs.susfs_branch || 'gki-android13-5.10' }}.patch"
+          if [ "${{ inputs.susfs_force }}" = "true" ]; then
+            patch -p1 --force < "$susfs_patch" || echo "Continuing despite patch failure"
+          else
+            patch -p1 < "$susfs_patch"
+          fi
+
+      - name: Apply BBG patches
+        if: ${{ inputs.bbg_support == true }}
+        run: |
+          cd "$KERNEL_DIR"
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+
+      - name: Prepare build scripts
+        run: |
+          chmod +x Scripts/build_kernel.sh
+          chmod +x Scripts/package_anykernel.sh
+
+      - name: Enable swap space
+        run: |
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          if sudo fallocate -l 12G /swapfile; then
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile || echo "Swap not permitted on this runner"
+          else
+            echo "Swap file allocation failed; continuing without swap"
+          fi
+
+      - name: Build kernel
+        run: |
+          SUSFS_SUPPORT="${{ inputs.susfs_support }}" \
+          BBG_SUPPORT="${{ inputs.bbg_support }}" \
+          Scripts/build_kernel.sh
+
+      - name: Package AnyKernel3
+        run: |
+          KERNEL_TYPE="${{ inputs.kernel_type || 'LineageOS' }}" Scripts/package_anykernel.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ inputs.kernel_type || 'LineageOS' }}-NP2-ReSukiSU
+          path: "kernel-${{ inputs.kernel_type || 'LineageOS' }}-NP2-ReSukiSU.zip"
+          retention-days: 30
+
+      - name: Upload .config for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-NP2-ReSukiSU
+          path: kernel/out/.config
+          retention-days: 1
+
+      - name: Collect .rej files
+        if: always()
+        id: collect_rej
+        run: |
+          mkdir -p rej
+          found=false
+          while IFS= read -r -d '' f; do
+            found=true
+            mkdir -p "rej/$(dirname "$f")"
+            cp "$f" "rej/$f"
+            orig="${f%.rej}"
+            [ -f "$orig" ] && cp "$orig" "rej/$orig"
+          done < <(find . -name '*.rej' -print0)
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .rej files
+        if: always() && steps.collect_rej.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rej-NP2-ReSukiSU
+          path: rej/
